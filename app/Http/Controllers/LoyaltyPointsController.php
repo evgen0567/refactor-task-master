@@ -5,57 +5,71 @@ namespace App\Http\Controllers;
 use App\Mail\LoyaltyPointsReceived;
 use App\Models\LoyaltyAccount;
 use App\Models\LoyaltyPointsTransaction;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Http\Request;
 
 class LoyaltyPointsController extends Controller
 {
-    public function deposit()
+    public function deposit(Request $request): JsonResponse|LoyaltyPointsTransaction
     {
-        $data = $_POST;
+        Log::info('Deposit transaction input: ' . print_r($request->all(), true));
 
-        Log::info('Deposit transaction input: ' . print_r($data, true));
+        try {
+            $account = $this->getLoyaltyAccount($request);
+        } catch (ModelNotFoundException $e) {
+            Log::info('Account is not found');
+            return response()->json(['message' => 'Account is not found'], 400);
+        }
 
-        $type = $data['account_type'];
-        $id = $data['account_id'];
-        if (($type == 'phone' || $type == 'card' || $type == 'email') && $id != '') {
-            if ($account = LoyaltyAccount::where($type, '=', $id)->first()) {
-                if ($account->active) {
-                    $transaction =  LoyaltyPointsTransaction::performPaymentLoyaltyPoints($account->id, $data['loyalty_points_rule'], $data['description'], $data['payment_id'], $data['payment_amount'], $data['payment_time']);
-                    Log::info($transaction);
-                    if ($account->email != '' && $account->email_notification) {
-                        Mail::to($account)->send(new LoyaltyPointsReceived($transaction->points_amount, $account->getBalance()));
-                    }
-                    if ($account->phone != '' && $account->phone_notification) {
-                        // instead SMS component
-                        Log::info('You received' . $transaction->points_amount . 'Your balance' . $account->getBalance());
-                    }
-                    return $transaction;
-                } else {
-                    Log::info('Account is not active');
-                    return response()->json(['message' => 'Account is not active'], 400);
-                }
-            } else {
-                Log::info('Account is not found');
-                return response()->json(['message' => 'Account is not found'], 400);
-            }
-        } else {
-            Log::info('Wrong account parameters');
-            throw new \InvalidArgumentException('Wrong account parameters');
+        if (!$account->active) {
+            Log::info('Account is not active');
+            return response()->json(['message' => 'Account is not active'], 400);
+        }
+
+        $loyaltyPointsRule = ($request->filled("loyalty_points_rule")) ? $request->loyalty_points_rule : throw new \InvalidArgumentException('Wrong parameters');
+        $description = ($request->filled("description")) ? $request->description : throw new \InvalidArgumentException('Wrong parameters');
+        $paymentId = ($request->filled("payment_id")) ? $request->payment_id : throw new \InvalidArgumentException('Wrong parameters');
+        $paymentAmount = ($request->filled("payment_amount")) ? $request->payment_amount : throw new \InvalidArgumentException('Wrong parameters');
+        $paymentTime = ($request->filled("payment_time")) ? $request->payment_time : throw new \InvalidArgumentException('Wrong parameters');
+
+        $transaction =  LoyaltyPointsTransaction::performPaymentLoyaltyPoints($account->id, $loyaltyPointsRule, $description, $paymentId, $paymentAmount, $paymentTime);
+        Log::info($transaction);
+        $this->sendNotifications($account, $transaction);
+        return $transaction;
+    }
+
+    private function getLoyaltyAccount(Request $request): LoyaltyAccount
+    {
+        $type = ($request->filled("account_type") && preg_match('/phone|card|email/ui', $request->account_type)) ?
+            $request->account_type : throw new \InvalidArgumentException('Wrong account parameters');
+        $id = ($request->filled("account_type")) ? $request->account_id : throw new \InvalidArgumentException('Wrong account parameters');
+        return LoyaltyAccount::where($type, '=', $id)->firstOrFail();
+    }
+
+    private function sendNotifications(LoyaltyAccount $account, LoyaltyPointsTransaction $transaction): void
+    {
+        if ($account->email !== '' && $account->email_notification) {
+            Mail::to($account)->send(new LoyaltyPointsReceived($transaction->points_amount, $account->getBalance()));
+        }
+        if ($account->phone !== '' && $account->phone_notification) {
+            // instead SMS component
+            Log::info('You received' . $transaction->points_amount . 'Your balance' . $account->getBalance());
         }
     }
 
-    public function cancel()
+    public function cancel(Request $request): ?JsonResponse
     {
-        $data = $_POST;
+        $reason = ($request->has("cancellation_reason")) ? $request->cancellation_reason : '';
+        $transactionId = ($request->filled("transaction_id")) ? $request->transaction_id : throw new \InvalidArgumentException('Wrong parameters');
 
-        $reason = $data['cancellation_reason'];
-
-        if ($reason == '') {
+        if ($reason === '') {
             return response()->json(['message' => 'Cancellation reason is not specified'], 400);
         }
 
-        if ($transaction = LoyaltyPointsTransaction::where('id', '=', $data['transaction_id'])->where('canceled', '=', 0)->first()) {
+        if ($transaction = LoyaltyPointsTransaction::where('id', '=', $transactionId)->where('canceled', '=', 0)->first()) {
             $transaction->canceled = time();
             $transaction->cancellation_reason = $reason;
             $transaction->save();
@@ -64,40 +78,36 @@ class LoyaltyPointsController extends Controller
         }
     }
 
-    public function withdraw()
+    public function withdraw(Request $request)
     {
-        $data = $_POST;
+        Log::info('Withdraw loyalty points transaction input: ' . print_r($request->all(), true));
 
-        Log::info('Withdraw loyalty points transaction input: ' . print_r($data, true));
-
-        $type = $data['account_type'];
-        $id = $data['account_id'];
-        if (($type == 'phone' || $type == 'card' || $type == 'email') && $id != '') {
-            if ($account = LoyaltyAccount::where($type, '=', $id)->first()) {
-                if ($account->active) {
-                    if ($data['points_amount'] <= 0) {
-                        Log::info('Wrong loyalty points amount: ' . $data['points_amount']);
-                        return response()->json(['message' => 'Wrong loyalty points amount'], 400);
-                    }
-                    if ($account->getBalance() < $data['points_amount']) {
-                        Log::info('Insufficient funds: ' . $data['points_amount']);
-                        return response()->json(['message' => 'Insufficient funds'], 400);
-                    }
-
-                    $transaction = LoyaltyPointsTransaction::withdrawLoyaltyPoints($account->id, $data['points_amount'], $data['description']);
-                    Log::info($transaction);
-                    return $transaction;
-                } else {
-                    Log::info('Account is not active: ' . $type . ' ' . $id);
-                    return response()->json(['message' => 'Account is not active'], 400);
-                }
-            } else {
-                Log::info('Account is not found:' . $type . ' ' . $id);
-                return response()->json(['message' => 'Account is not found'], 400);
-            }
-        } else {
-            Log::info('Wrong account parameters');
-            throw new \InvalidArgumentException('Wrong account parameters');
+        try {
+            $account = $this->getLoyaltyAccount($request);
+        } catch (ModelNotFoundException $e) {
+            Log::info('Account is not found');
+            return response()->json(['message' => 'Account is not found'], 400);
         }
+
+        if (!$account->active) {
+            Log::info('Account is not active');
+            return response()->json(['message' => 'Account is not active'], 400);
+        }
+
+        $pointsAmount = ($request->filled("points_amount")) ? $request->points_amount : throw new \InvalidArgumentException('Wrong parameters');
+        $description = ($request->filled("description")) ? $request->description : throw new \InvalidArgumentException('Wrong parameters');
+
+        if ($pointsAmount <= 0) {
+            Log::info('Wrong loyalty points amount: ' . $pointsAmount);
+            return response()->json(['message' => 'Wrong loyalty points amount'], 400);
+        }
+        if ($account->getBalance() < $pointsAmount) {
+            Log::info('Insufficient funds: ' . $pointsAmount);
+            return response()->json(['message' => 'Insufficient funds'], 400);
+        }
+
+        $transaction = LoyaltyPointsTransaction::withdrawLoyaltyPoints($account->id, $pointsAmount, $description);
+        Log::info($transaction);
+        return $transaction;
     }
 }
